@@ -489,6 +489,53 @@ class DiskOperationsMixin:
                     "free": 0
                 }
 
+            # First try BTRFS
+            btrfs_result = await self.execute_command("btrfs filesystem df /mnt/cache")
+            if btrfs_result.exit_status == 0:
+                try:
+                    # Parse BTRFS output
+                    total = 0
+                    used = 0
+                    for line in btrfs_result.stdout.splitlines():
+                        if "Data" in line:
+                            parts = line.split()
+                            total = int(parts[2])
+                            used = int(parts[3])
+                            break
+                    
+                    return {
+                        "status": "active",
+                        "percentage": round((used / total * 100), 1) if total > 0 else 0,
+                        "total": total,
+                        "used": used,
+                        "free": total - used,
+                        "filesystem": "btrfs"
+                    }
+                except (ValueError, IndexError) as err:
+                    _LOGGER.warning("Error parsing BTRFS output: %s", err)
+
+            # If BTRFS fails, try ZFS
+            zfs_result = await self.execute_command("zfs list -o name,used,available,refer,mountpoint cache")
+            if zfs_result.exit_status == 0:
+                try:
+                    # Parse ZFS output (format: name used avail refer mountpoint)
+                    _, used, avail, _, _ = zfs_result.stdout.strip().split()
+                    # Convert ZFS values (they're in bytes)
+                    used_bytes = int(used)
+                    total_bytes = int(used) + int(avail)
+                    
+                    return {
+                        "status": "active",
+                        "percentage": round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0,
+                        "total": total_bytes,
+                        "used": used_bytes,
+                        "free": int(avail),
+                        "filesystem": "zfs"
+                    }
+                except (ValueError, IndexError) as err:
+                    _LOGGER.warning("Error parsing ZFS output: %s", err)
+
+            # If both BTRFS and ZFS fail, fall back to df
             result = await self.execute_command(
                 "df -k /mnt/cache | awk 'NR==2 {print $2,$3,$4}'"
             )
@@ -505,15 +552,13 @@ class DiskOperationsMixin:
 
             try:
                 total, used, free = map(int, result.stdout.strip().split())
-                pool_info = await self._get_cache_pool_info()
-
                 return {
                     "status": "active",
                     "percentage": round((used / total) * 100, 1) if total > 0 else 0,
                     "total": total * 1024,
                     "used": used * 1024,
                     "free": free * 1024,
-                    "pool_status": pool_info
+                    "filesystem": "unknown"
                 }
 
             except (ValueError, TypeError) as err:
@@ -541,28 +586,58 @@ class DiskOperationsMixin:
     async def _get_cache_pool_info(self) -> Optional[Dict[str, Any]]:
         """Get detailed cache pool information."""
         try:
-            result = await self.execute_command("btrfs filesystem show /mnt/cache")
-            if result.exit_status != 0:
-                return None
+            # First try BTRFS
+            btrfs_result = await self.execute_command("btrfs filesystem show /mnt/cache")
+            if btrfs_result.exit_status == 0:
+                pool_info = {
+                    "filesystem": "btrfs",
+                    "devices": [],
+                    "total_devices": 0,
+                    "raid_type": "single"
+                }
 
-            pool_info = {
-                "filesystem": "btrfs",
-                "devices": [],
-                "total_devices": 0,
-                "raid_type": "single"
-            }
+                for line in btrfs_result.stdout.splitlines():
+                    if "devices:" in line.lower():
+                        pool_info["total_devices"] = int(line.split()[0])
+                    elif "raid" in line.lower():
+                        pool_info["raid_type"] = line.split()[0].lower()
+                    elif "/dev/" in line:
+                        device = line.split()[-1]
+                        if device.startswith("/dev/"):
+                            pool_info["devices"].append(device)
 
-            for line in result.stdout.splitlines():
-                if "devices:" in line.lower():
-                    pool_info["total_devices"] = int(line.split()[0])
-                elif "raid" in line.lower():
-                    pool_info["raid_type"] = line.split()[0].lower()
-                elif "/dev/" in line:
-                    device = line.split()[-1]
-                    if device.startswith("/dev/"):
-                        pool_info["devices"].append(device)
+                return pool_info
 
-            return pool_info
+            # If BTRFS fails, try ZFS
+            zfs_result = await self.execute_command("zpool list cache")
+            if zfs_result.exit_status == 0:
+                pool_info = {
+                    "filesystem": "zfs",
+                    "devices": [],
+                    "total_devices": 0,
+                    "raid_type": "unknown",
+                    "health": "unknown",
+                    "capacity": 0
+                }
+                
+                # Parse ZFS pool info
+                for line in zfs_result.stdout.splitlines():
+                    if line.startswith("cache"):
+                        parts = line.split()
+                        if len(parts) >= 8:
+                            # Extract capacity percentage (remove % sign)
+                            pool_info["capacity"] = float(parts[6].strip('%'))
+                            # Extract health status
+                            pool_info["health"] = parts[8]
+                    elif "/dev/" in line:
+                        device = line.split()[-1]
+                        if device.startswith("/dev/"):
+                            pool_info["devices"].append(device)
+                
+                pool_info["total_devices"] = len(pool_info["devices"])
+                return pool_info
+
+            return None
 
         except (OSError, ValueError) as err:
             _LOGGER.debug("Error getting cache pool info: %s", err)
