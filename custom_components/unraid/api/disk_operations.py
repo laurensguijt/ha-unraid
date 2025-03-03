@@ -479,6 +479,7 @@ class DiskOperationsMixin:
         try:
             _LOGGER.debug("Fetching cache usage")
 
+            # First check if cache is mounted
             mount_check = await self.execute_command("mountpoint -q /mnt/cache")
             if mount_check.exit_status != 0:
                 _LOGGER.debug("Cache is not mounted")
@@ -490,8 +491,63 @@ class DiskOperationsMixin:
                     "free": 0
                 }
 
-            # First try BTRFS
-            _LOGGER.debug("Trying BTRFS first")
+            # Get disk mappings to check filesystem type
+            mappings = await self.get_disk_mappings()
+            cache_info = mappings.get("cache", {})
+            
+            # If it's a ZFS filesystem, try ZFS commands first
+            if cache_info.get("filesystem") == "zfs":
+                _LOGGER.debug("Cache is ZFS, trying ZFS commands")
+                zfs_result = await self.execute_command("zfs list -o name,used,available,refer,mountpoint cache")
+                _LOGGER.debug("ZFS command exit status: %s", zfs_result.exit_status)
+                _LOGGER.debug("Raw ZFS output: %s", zfs_result.stdout)
+                
+                if zfs_result.exit_status == 0:
+                    try:
+                        # Parse ZFS output (format: name used avail refer mountpoint)
+                        lines = zfs_result.stdout.strip().splitlines()
+                        _LOGGER.debug("ZFS output lines: %s", lines)
+                        
+                        if len(lines) >= 2:  # Skip header line
+                            _, used, avail, _, _ = lines[1].split()
+                            _LOGGER.debug("ZFS raw values - Used: %s, Available: %s", used, avail)
+                            
+                            # Convert ZFS values (they're in bytes)
+                            def convert_to_bytes(value: str) -> int:
+                                value = value.strip()
+                                multiplier = 1
+                                if value.endswith('G'):
+                                    multiplier = 1024 * 1024 * 1024
+                                    value = value[:-1]
+                                elif value.endswith('T'):
+                                    multiplier = 1024 * 1024 * 1024 * 1024
+                                    value = value[:-1]
+                                return int(float(value) * multiplier)
+                            
+                            used_bytes = convert_to_bytes(used)
+                            avail_bytes = convert_to_bytes(avail)
+                            total_bytes = used_bytes + avail_bytes
+                            
+                            _LOGGER.debug("ZFS converted values - Used: %s, Available: %s, Total: %s", 
+                                        used_bytes, avail_bytes, total_bytes)
+                            
+                            percentage = round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0
+                            _LOGGER.debug("Calculated percentage: %s", percentage)
+                            
+                            return {
+                                "status": "active",
+                                "percentage": percentage,
+                                "total": total_bytes,
+                                "used": used_bytes,
+                                "free": avail_bytes,
+                                "filesystem": "zfs"
+                            }
+                    except (ValueError, IndexError) as err:
+                        _LOGGER.warning("Error parsing ZFS output: %s", err)
+                        _LOGGER.debug("Raw ZFS output: %s", zfs_result.stdout)
+
+            # If ZFS fails or it's not ZFS, try BTRFS
+            _LOGGER.debug("Trying BTRFS")
             btrfs_result = await self.execute_command("btrfs filesystem df /mnt/cache")
             if btrfs_result.exit_status == 0:
                 _LOGGER.debug("BTRFS command succeeded")
@@ -519,58 +575,24 @@ class DiskOperationsMixin:
                     _LOGGER.warning("Error parsing BTRFS output: %s", err)
                     _LOGGER.debug("Raw BTRFS output: %s", btrfs_result.stdout)
 
-            # If BTRFS fails, try ZFS
-            _LOGGER.debug("Trying ZFS")
-            zfs_result = await self.execute_command("zfs list -o name,used,available,refer,mountpoint cache")
-            _LOGGER.debug("ZFS command exit status: %s", zfs_result.exit_status)
-            _LOGGER.debug("Raw ZFS output: %s", zfs_result.stdout)
-            
-            if zfs_result.exit_status == 0:
-                try:
-                    # Parse ZFS output (format: name used avail refer mountpoint)
-                    lines = zfs_result.stdout.strip().splitlines()
-                    _LOGGER.debug("ZFS output lines: %s", lines)
-                    
-                    if len(lines) >= 2:  # Skip header line
-                        _, used, avail, _, _ = lines[1].split()
-                        _LOGGER.debug("ZFS raw values - Used: %s, Available: %s", used, avail)
-                        
-                        # Convert ZFS values (they're in bytes)
-                        # Remove any suffixes (G, T, etc) and convert to bytes
-                        def convert_to_bytes(value: str) -> int:
-                            value = value.strip()
-                            multiplier = 1
-                            if value.endswith('G'):
-                                multiplier = 1024 * 1024 * 1024
-                                value = value[:-1]
-                            elif value.endswith('T'):
-                                multiplier = 1024 * 1024 * 1024 * 1024
-                                value = value[:-1]
-                            return int(float(value) * multiplier)
-                        
-                        used_bytes = convert_to_bytes(used)
-                        avail_bytes = convert_to_bytes(avail)
-                        total_bytes = used_bytes + avail_bytes
-                        
-                        _LOGGER.debug("ZFS converted values - Used: %s, Available: %s, Total: %s", 
-                                    used_bytes, avail_bytes, total_bytes)
-                        
-                        percentage = round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0
-                        _LOGGER.debug("Calculated percentage: %s", percentage)
-                        
-                        return {
-                            "status": "active",
-                            "percentage": percentage,
-                            "total": total_bytes,
-                            "used": used_bytes,
-                            "free": avail_bytes,
-                            "filesystem": "zfs"
-                        }
-                except (ValueError, IndexError) as err:
-                    _LOGGER.warning("Error parsing ZFS output: %s", err)
-                    _LOGGER.debug("Raw ZFS output: %s", zfs_result.stdout)
+            # If both ZFS and BTRFS fail, use values from disks.ini
+            if cache_info:
+                _LOGGER.debug("Using values from disks.ini")
+                total = int(cache_info.get("fsSize", 0))
+                used = int(cache_info.get("fsUsed", 0))
+                free = int(cache_info.get("fsFree", 0))
+                
+                _LOGGER.debug("disks.ini values - Used: %s, Total: %s", used, total)
+                return {
+                    "status": "active",
+                    "percentage": round((used / total * 100), 1) if total > 0 else 0,
+                    "total": total,
+                    "used": used,
+                    "free": free,
+                    "filesystem": cache_info.get("filesystem", "unknown")
+                }
 
-            # If both BTRFS and ZFS fail, fall back to df
+            # If all else fails, try df as last resort
             _LOGGER.debug("Falling back to df command")
             result = await self.execute_command(
                 "df -k /mnt/cache | awk 'NR==2 {print $2,$3,$4}'"
