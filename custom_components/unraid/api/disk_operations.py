@@ -519,21 +519,40 @@ class DiskOperationsMixin:
             if zfs_result.exit_status == 0:
                 try:
                     # Parse ZFS output (format: name used avail refer mountpoint)
-                    _, used, avail, _, _ = zfs_result.stdout.strip().split()
-                    # Convert ZFS values (they're in bytes)
-                    used_bytes = int(used)
-                    total_bytes = int(used) + int(avail)
-                    
-                    return {
-                        "status": "active",
-                        "percentage": round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0,
-                        "total": total_bytes,
-                        "used": used_bytes,
-                        "free": int(avail),
-                        "filesystem": "zfs"
-                    }
+                    lines = zfs_result.stdout.strip().splitlines()
+                    if len(lines) >= 2:  # Skip header line
+                        _, used, avail, _, _ = lines[1].split()
+                        # Convert ZFS values (they're in bytes)
+                        # Remove any suffixes (G, T, etc) and convert to bytes
+                        def convert_to_bytes(value: str) -> int:
+                            value = value.strip()
+                            multiplier = 1
+                            if value.endswith('G'):
+                                multiplier = 1024 * 1024 * 1024
+                                value = value[:-1]
+                            elif value.endswith('T'):
+                                multiplier = 1024 * 1024 * 1024 * 1024
+                                value = value[:-1]
+                            return int(float(value) * multiplier)
+                        
+                        used_bytes = convert_to_bytes(used)
+                        avail_bytes = convert_to_bytes(avail)
+                        total_bytes = used_bytes + avail_bytes
+                        
+                        _LOGGER.debug("ZFS values - Used: %s, Available: %s, Total: %s", 
+                                    used_bytes, avail_bytes, total_bytes)
+                        
+                        return {
+                            "status": "active",
+                            "percentage": round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0,
+                            "total": total_bytes,
+                            "used": used_bytes,
+                            "free": avail_bytes,
+                            "filesystem": "zfs"
+                        }
                 except (ValueError, IndexError) as err:
                     _LOGGER.warning("Error parsing ZFS output: %s", err)
+                    _LOGGER.debug("Raw ZFS output: %s", zfs_result.stdout)
 
             # If both BTRFS and ZFS fail, fall back to df
             result = await self.execute_command(
