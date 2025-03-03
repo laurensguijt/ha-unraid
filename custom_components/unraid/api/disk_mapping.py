@@ -120,6 +120,18 @@ async def parse_disks_ini(execute_command) -> Dict[str, Dict[str, Any]]:
                 key, value = line.split("=", 1)
                 key = key.strip().strip('"')
                 value = value.strip().strip('"')
+                
+                # Special handling for ZFS values
+                if key in ["fsSize", "fsUsed", "fsFree"]:
+                    try:
+                        # Convert to integer, handling any potential decimal points
+                        value = int(float(value))
+                        _LOGGER.debug("Parsed ZFS value for %s.%s: %d", current_disk, key, value)
+                    except (ValueError, TypeError) as err:
+                        _LOGGER.warning("Invalid ZFS value for %s.%s: %s - %s", current_disk, key, value, err)
+                        continue
+                
+                # Store the value
                 disk_data[key] = value
 
         # Add last disk if exists

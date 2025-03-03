@@ -460,6 +460,15 @@ class DiskOperationsMixin:
                         if state == DiskState.ACTIVE:
                             disk_info = await self.update_disk_status(disk_info)
                             
+                        # Fix percentage calculation for cache disk
+                        if disk_name == "cache":
+                            total_bytes = disk_info["total"]
+                            used_bytes = disk_info["used"]
+                            if total_bytes > 0:
+                                disk_info["percentage"] = round((used_bytes / total_bytes * 100), 1)
+                            else:
+                                disk_info["percentage"] = 0
+                            
                         disks.append(disk_info)
 
                     except (ValueError, IndexError) as err:
@@ -495,8 +504,36 @@ class DiskOperationsMixin:
             mappings = await self.get_disk_mappings()
             cache_info = mappings.get("cache", {})
             
-            # If it's a ZFS filesystem, try ZFS commands first
-            if cache_info.get("filesystem") == "zfs":
+            _LOGGER.debug("Cache info from mappings: %s", cache_info)
+            
+            # If we have ZFS values in disks.ini, use those first
+            if cache_info.get("fsType") == "zfs":
+                _LOGGER.debug("Cache is ZFS, checking for values in disks.ini")
+                if cache_info.get("fsSize"):
+                    _LOGGER.debug("Using ZFS values from disks.ini")
+                    # Convert from KB to bytes (multiply by 1024)
+                    total = int(cache_info.get("fsSize", 0)) * 1024
+                    used = int(cache_info.get("fsUsed", 0)) * 1024
+                    free = int(cache_info.get("fsFree", 0)) * 1024
+                    
+                    _LOGGER.debug("ZFS values from disks.ini - Used: %s, Total: %s", used, total)
+                    
+                    # Calculate percentage only if total is greater than 0
+                    percentage = round((used / total * 100), 1) if total > 0 else 0
+                    
+                    return {
+                        "status": "active",
+                        "percentage": percentage,
+                        "total": total,
+                        "used": used,
+                        "free": free,
+                        "filesystem": "zfs"
+                    }
+                else:
+                    _LOGGER.debug("No ZFS values found in disks.ini, falling back to ZFS commands")
+
+            # If it's a ZFS filesystem but no values in disks.ini, try ZFS commands
+            if cache_info.get("fsType") == "zfs":
                 _LOGGER.debug("Cache is ZFS, trying ZFS commands")
                 zfs_result = await self.execute_command("zfs list -o name,used,available,refer,mountpoint cache")
                 _LOGGER.debug("ZFS command exit status: %s", zfs_result.exit_status)
@@ -550,6 +587,7 @@ class DiskOperationsMixin:
                             _LOGGER.debug("ZFS converted values - Used: %s, Available: %s, Total: %s", 
                                         used_bytes, avail_bytes, total_bytes)
                             
+                            # Calculate percentage only if total is greater than 0
                             percentage = round((used_bytes / total_bytes * 100), 1) if total_bytes > 0 else 0
                             _LOGGER.debug("Calculated percentage: %s", percentage)
                             
@@ -582,9 +620,13 @@ class DiskOperationsMixin:
                             break
                     
                     _LOGGER.debug("BTRFS values - Used: %s, Total: %s", used, total)
+                    
+                    # Calculate percentage only if total is greater than 0
+                    percentage = round((used / total * 100), 1) if total > 0 else 0
+                    
                     return {
                         "status": "active",
-                        "percentage": round((used / total * 100), 1) if total > 0 else 0,
+                        "percentage": percentage,
                         "total": total,
                         "used": used,
                         "free": total - used,
@@ -593,23 +635,6 @@ class DiskOperationsMixin:
                 except (ValueError, IndexError) as err:
                     _LOGGER.warning("Error parsing BTRFS output: %s", err)
                     _LOGGER.debug("Raw BTRFS output: %s", btrfs_result.stdout)
-
-            # If both ZFS and BTRFS fail, use values from disks.ini
-            if cache_info:
-                _LOGGER.debug("Using values from disks.ini")
-                total = int(cache_info.get("fsSize", 0))
-                used = int(cache_info.get("fsUsed", 0))
-                free = int(cache_info.get("fsFree", 0))
-                
-                _LOGGER.debug("disks.ini values - Used: %s, Total: %s", used, total)
-                return {
-                    "status": "active",
-                    "percentage": round((used / total * 100), 1) if total > 0 else 0,
-                    "total": total,
-                    "used": used,
-                    "free": free,
-                    "filesystem": cache_info.get("filesystem", "unknown")
-                }
 
             # If all else fails, try df as last resort
             _LOGGER.debug("Falling back to df command")
@@ -631,9 +656,13 @@ class DiskOperationsMixin:
             try:
                 total, used, free = map(int, result.stdout.strip().split())
                 _LOGGER.debug("df values - Used: %s, Total: %s", used, total)
+                
+                # Calculate percentage only if total is greater than 0
+                percentage = round((used / total) * 100, 1) if total > 0 else 0
+                
                 return {
                     "status": "active",
-                    "percentage": round((used / total) * 100, 1) if total > 0 else 0,
+                    "percentage": percentage,
                     "total": total * 1024,
                     "used": used * 1024,
                     "free": free * 1024,
