@@ -509,20 +509,39 @@ class DiskOperationsMixin:
                         _LOGGER.debug("ZFS output lines: %s", lines)
                         
                         if len(lines) >= 2:  # Skip header line
-                            _, used, avail, _, _ = lines[1].split()
+                            # Log the raw line we're trying to parse
+                            _LOGGER.debug("Parsing ZFS line: %s", lines[1])
+                            
+                            # Split the line and ensure we have enough fields
+                            fields = lines[1].split()
+                            if len(fields) < 5:
+                                _LOGGER.error("Invalid ZFS output format. Expected 5 fields, got %d: %s", len(fields), fields)
+                                raise ValueError("Invalid ZFS output format")
+                                
+                            _, used, avail, _, _ = fields
                             _LOGGER.debug("ZFS raw values - Used: %s, Available: %s", used, avail)
                             
                             # Convert ZFS values (they're in bytes)
                             def convert_to_bytes(value: str) -> int:
                                 value = value.strip()
                                 multiplier = 1
-                                if value.endswith('G'):
+                                if value.endswith('K'):
+                                    multiplier = 1024
+                                    value = value[:-1]
+                                elif value.endswith('M'):
+                                    multiplier = 1024 * 1024
+                                    value = value[:-1]
+                                elif value.endswith('G'):
                                     multiplier = 1024 * 1024 * 1024
                                     value = value[:-1]
                                 elif value.endswith('T'):
                                     multiplier = 1024 * 1024 * 1024 * 1024
                                     value = value[:-1]
-                                return int(float(value) * multiplier)
+                                try:
+                                    return int(float(value) * multiplier)
+                                except (ValueError, TypeError) as err:
+                                    _LOGGER.error("Error converting ZFS value '%s': %s", value, err)
+                                    raise
                             
                             used_bytes = convert_to_bytes(used)
                             avail_bytes = convert_to_bytes(avail)
