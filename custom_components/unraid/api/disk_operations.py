@@ -475,32 +475,90 @@ class DiskOperationsMixin:
             return []
 
     async def get_cache_usage(self) -> Dict[str, Any]:
-        """Get cache pool usage with enhanced error handling."""
+        """Get cache pool usage with ZFS support and enhanced error handling."""
         try:
             _LOGGER.debug("Fetching cache usage")
+            debug_info = {
+                "filesystem_type": None,
+                "commands_tried": [],
+                "errors": [],
+                "raw_data": {}
+            }
 
+            # First check if cache is mounted
             mount_check = await self.execute_command("mountpoint -q /mnt/cache")
+            _LOGGER.debug("Mount check result: %s", mount_check.exit_status)
+            
             if mount_check.exit_status != 0:
+                _LOGGER.warning("Cache not mounted")
                 return {
                     "status": "not_mounted",
                     "percentage": 0,
                     "total": 0,
                     "used": 0,
-                    "free": 0
+                    "free": 0,
+                    "debug_info": debug_info
                 }
 
+            # Detect filesystem type
+            fs_check = await self.execute_command("findmnt -n -o FSTYPE /mnt/cache")
+            fs_type = fs_check.stdout.strip() if fs_check.exit_status == 0 else "unknown"
+            _LOGGER.debug("Detected filesystem type: %s", fs_type)
+            debug_info["filesystem_type"] = fs_type
+            debug_info["commands_tried"].append({"findmnt": fs_check.stdout.strip()})
+            
+            if fs_type == "zfs":
+                _LOGGER.debug("ZFS filesystem detected for cache")
+                pool_info = await self._get_zfs_pool_info("cache")
+                debug_info["raw_data"]["pool_info"] = pool_info
+                
+                if "error" in pool_info:
+                    _LOGGER.error("Error getting ZFS pool info: %s", pool_info["error"])
+                    debug_info["errors"].append(pool_info["error"])
+                    if "debug_info" in pool_info:
+                        debug_info.update(pool_info["debug_info"])
+                    return {
+                        "status": "error",
+                        "percentage": 0,
+                        "total": 0,
+                        "used": 0,
+                        "free": 0,
+                        "error": pool_info["error"],
+                        "debug_info": debug_info
+                    }
+
+                _LOGGER.debug("ZFS pool info retrieved successfully: %s", pool_info)
+                return {
+                    "status": "active",
+                    "percentage": pool_info["percentage"],
+                    "total": pool_info["total"],
+                    "used": pool_info["used"],
+                    "free": pool_info["free"],
+                    "pool_status": {
+                        "filesystem": "zfs",
+                        "health": pool_info["health"]
+                    },
+                    "debug_info": debug_info
+                }
+
+            # Fallback to existing btrfs/xfs handling
             result = await self.execute_command(
                 "df -k /mnt/cache | awk 'NR==2 {print $2,$3,$4}'"
             )
+            debug_info["commands_tried"].append({"df": result.stdout.strip()})
 
             if result.exit_status != 0:
+                error_msg = f"df command failed: {result.stderr}"
+                _LOGGER.error(error_msg)
+                debug_info["errors"].append(error_msg)
                 return {
                     "status": "error",
                     "percentage": 0,
                     "total": 0,
                     "used": 0,
                     "free": 0,
-                    "error": "Failed to get cache usage"
+                    "error": "Failed to get cache usage",
+                    "debug_info": debug_info
                 }
 
             try:
@@ -513,29 +571,38 @@ class DiskOperationsMixin:
                     "total": total * 1024,
                     "used": used * 1024,
                     "free": free * 1024,
-                    "pool_status": pool_info
+                    "pool_status": pool_info,
+                    "debug_info": debug_info
                 }
 
             except (ValueError, TypeError) as err:
-                _LOGGER.error("Error parsing cache usage: %s", err)
+                error_msg = f"Error parsing usage output: {str(err)}"
+                _LOGGER.error(error_msg)
+                debug_info["errors"].append(error_msg)
                 return {
                     "status": "error",
                     "percentage": 0,
                     "total": 0,
                     "used": 0,
                     "free": 0,
-                    "error": str(err)
+                    "error": str(err),
+                    "debug_info": debug_info
                 }
 
-        except OSError as err:
-            _LOGGER.error("Error getting cache usage: %s", err)
+        except Exception as err:
+            error_msg = f"Error getting cache usage: {str(err)}"
+            _LOGGER.error(error_msg)
             return {
                 "status": "error",
                 "percentage": 0,
                 "total": 0,
                 "used": 0,
                 "free": 0,
-                "error": str(err)
+                "error": str(err),
+                "debug_info": {
+                    "filesystem_type": "unknown",
+                    "errors": [error_msg]
+                }
             }
 
     async def _get_cache_pool_info(self) -> Optional[Dict[str, Any]]:
@@ -591,3 +658,103 @@ class DiskOperationsMixin:
         except (TypeError, ValueError) as err:
             _LOGGER.debug("Error getting temperature stats: %s", err)
         return stats
+
+    async def _get_zfs_pool_info(self, pool_name: str) -> Dict[str, Any]:
+        """Get detailed ZFS pool information with enhanced error handling."""
+        debug_info = {
+            "commands_output": {},
+            "errors": [],
+            "raw_values": {}
+        }
+        
+        try:
+            # Get pool status
+            pool_cmd = f"zpool list -H -o name,size,alloc,free,capacity,health {pool_name}"
+            _LOGGER.debug("Executing ZFS pool command: %s", pool_cmd)
+            pool_result = await self.execute_command(pool_cmd)
+            _LOGGER.debug("ZFS pool command result: %s", pool_result.stdout.strip())
+            
+            debug_info["commands_output"]["zpool_list"] = {
+                "exit_status": pool_result.exit_status,
+                "stdout": pool_result.stdout.strip(),
+                "stderr": pool_result.stderr.strip() if pool_result.stderr else ""
+            }
+            
+            if pool_result.exit_status != 0:
+                error_msg = f"ZFS pool command failed: {pool_result.stderr}"
+                _LOGGER.error(error_msg)
+                debug_info["errors"].append(error_msg)
+                return {"error": "Failed to get pool info", "debug_info": debug_info}
+                
+            # Parse pool information
+            try:
+                name, size, alloc, free, capacity, health = pool_result.stdout.strip().split('\t')
+                _LOGGER.debug("Parsed ZFS values - size: %s, alloc: %s, capacity: %s", 
+                             size, alloc, capacity)
+                
+                debug_info["raw_values"]["pool"] = {
+                    "name": name,
+                    "size": size,
+                    "alloc": alloc,
+                    "free": free,
+                    "capacity": capacity,
+                    "health": health
+                }
+                
+                # Convert sizes to bytes
+                size_bytes = self._parse_zfs_size(size)
+                used_bytes = self._parse_zfs_size(alloc)
+                free_bytes = self._parse_zfs_size(free)
+                percentage = float(capacity.strip('%'))
+                
+                _LOGGER.debug("Converted values - size_bytes: %d, used_bytes: %d, percentage: %f",
+                             size_bytes, used_bytes, percentage)
+                
+                return {
+                    "filesystem": "zfs",
+                    "total": size_bytes,
+                    "used": used_bytes,
+                    "free": free_bytes,
+                    "percentage": percentage,
+                    "health": health,
+                    "debug_info": debug_info
+                }
+                
+            except ValueError as ve:
+                error_msg = f"Error parsing ZFS output: {ve}"
+                _LOGGER.error(error_msg)
+                debug_info["errors"].append(error_msg)
+                return {"error": "Failed to parse ZFS output", "debug_info": debug_info}
+                
+        except Exception as err:
+            error_msg = f"Unexpected error getting ZFS info: {err}"
+            _LOGGER.error(error_msg)
+            debug_info["errors"].append(error_msg)
+            return {"error": "Unexpected error", "debug_info": debug_info}
+
+    def _parse_zfs_size(self, size_str: str) -> int:
+        """Convert ZFS size string to bytes with enhanced error handling."""
+        try:
+            _LOGGER.debug("Parsing ZFS size string: %s", size_str)
+            size_str = size_str.strip().upper()
+            multipliers = {
+                'K': 1024,
+                'M': 1024 ** 2,
+                'G': 1024 ** 3,
+                'T': 1024 ** 4
+            }
+            
+            if size_str[-1] in multipliers:
+                number = float(size_str[:-1])
+                result = int(number * multipliers[size_str[-1]])
+                _LOGGER.debug("Converted %s to %d bytes", size_str, result)
+                return result
+            
+            result = int(float(size_str))
+            _LOGGER.debug("Converted %s to %d bytes (no multiplier)", size_str, result)
+            return result
+            
+        except (ValueError, IndexError) as err:
+            error_msg = f"Error parsing ZFS size '{size_str}': {err}"
+            _LOGGER.error(error_msg)
+            raise ValueError(error_msg) from err

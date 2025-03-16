@@ -56,7 +56,7 @@ class SystemOperationsMixin:
         memory_usage = await self._get_memory_usage()
         array_usage = await self.get_array_usage()
         individual_disks = await self.get_individual_disk_usage()
-        cache_usage = await self._get_cache_usage()
+        cache_usage = await self.get_cache_usage()
         boot_usage = await self._get_boot_usage()
         uptime = await self._get_uptime()
         ups_info = await self.get_ups_info()
@@ -419,64 +419,6 @@ class SystemOperationsMixin:
         except (asyncssh.Error, asyncio.TimeoutError, OSError, ValueError) as e:
             _LOGGER.error("Error getting uptime: %s", str(e))
             return None
-
-    async def _get_cache_usage(self) -> Dict[str, Any]:
-        """Fetch cache information from the Unraid system."""
-        try:
-            _LOGGER.debug("Fetching cache usage")
-            # First check if cache is mounted
-            cache_check = await self.execute_command("mountpoint -q /mnt/cache")
-            if cache_check.exit_status != 0:
-                _LOGGER.debug("Cache is not mounted, skipping usage check")
-                return {
-                    "percentage": 0,
-                    "total": 0,
-                    "used": 0,
-                    "free": 0,
-                    "status": "not_mounted"
-                }
-
-            result = await self.execute_command("df -k /mnt/cache | awk 'NR==2 {print $2,$3,$4}'")
-            if result.exit_status != 0:
-                _LOGGER.debug("Cache usage command failed, cache might not be available")
-                return {
-                    "percentage": 0,
-                    "total": 0,
-                    "used": 0,
-                    "free": 0,
-                    "status": "error"
-                }
-
-            output = result.stdout.strip()
-            if not output:
-                return {
-                    "percentage": 0,
-                    "total": 0,
-                    "used": 0,
-                    "free": 0,
-                    "status": "empty"
-                }
-
-            total, used, free = map(int, output.split())
-            percentage = (used / total) * 100 if total > 0 else 0
-
-            return {
-                "percentage": round(percentage, 2),
-                "total": total * 1024,  # Convert to bytes
-                "used": used * 1024,    # Convert to bytes
-                "free": free * 1024,    # Convert to bytes
-                "status": "mounted"
-            }
-
-        except (asyncssh.Error, asyncio.TimeoutError, OSError, ValueError) as e:
-            _LOGGER.error("Error getting cache usage: %s", str(e))
-            return {
-                "percentage": 0,
-                "total": 0,
-                "used": 0,
-                "free": 0,
-                "status": "error"
-            }
 
     async def _get_log_filesystem_usage(self) -> Dict[str, Any]:
         """Fetch log filesystem information from the Unraid system."""
